@@ -1,0 +1,184 @@
+#!/bin/bash 
+
+  ######################################################################
+ ######################################################################
+## Author: A.M. Danischewski, Created Date: 20220406, Version: v1.0
+## Major Revisions: 1.0
+## Last Modified: 2022-04-05
+## Issues: If you find any issues emai1 me at Adam dot
+##         Danischewski at gmail dot com.
+## 
+## This script is designed to perform a time based PITR on a postgres 
+## version 10+ database (wal vs x logs). It was designed to work on my 
+## particular small test env - Windows 11 Pro using WSL Ubuntu. So what-
+## ever needs to get run from Postgres has to be in Windows path format 
+## whatever is run from WSL is in Linux path format. Other than that its 
+## pretty simple, the recommended way to use this is to take a pg_basebackup 
+## in tar format. That will be your base backup, make sure archiving is on 
+## and logs are landing where they are supposed to. Then you can modify this 
+## scripts default settings below and run this script with the -a option. 
+## After you successfully stand up the PITR you should be able to pg_dump 
+## your missing data or whatever else you need to get/do.   
+##
+ ######################################################################
+  ######################################################################
+
+HELP=$(cat<<EOF
+
+ $(sed 's/^[^[:alpha:]]*//g' <<< "${0}") [-h|-a]
+    -h Help 
+    -a auto [First manually edit the script variable defaults to use this option.]
+
+#########################################################################################
+#########################################################################################
+## This script performs a PITR recovery to a particular timestamp for a Postgres 10+ db, 
+## tested on Windows 11 Pro running Postgres 14 via WSL (set to version 1) Ubuntu. 
+## 
+## The base backup needs to be created generating a tar file before using this. 
+## E.g. pg_basebackup.exe -Ft -d <db> -h localhost -p 5432 -U <db user> 
+## 
+## Make sure that WAL archiving is turned on, here are some postgresql.conf options that 
+## were used in testing. The archive command location will be the location you put for 
+## the primary DB Wal Directory when prompted in the PITR recovery process via this script.  
+##  postgresql.conf:
+##   checkpoint_timeout = 1h 		# range 30s-1d
+##   max_wal_size = 1GB
+##   min_wal_size = 80MB
+##   archive_mode = on
+##   archive_command = 'copy "%p" "D:\\postgres_archives\\replica_a\\%f"'
+##
+## Note: when selecting a timestamp, make sure to rotate the logfiles 
+##  e.g. psql> select now();
+##       psql> drop table test; 
+##       psql> select pg_switch_wal(); 
+## 
+## Also this is a Ubuntu WSL hybrid, what runs via Postgres needs windows commands and path 
+## synta for the primary DB WAL Directory. 
+##
+## Feel free to hack this script and make it "yours". E.g. LSN based   
+##
+##########################################################################################
+##########################################################################################
+EOF
+)
+
+grep -i -Eq -- '-h|-\?' <<< "${1}" && { echo "${HELP}"|more;} && exit 0
+
+createdb_CMD="$(command -v createdb.exe)"
+psql_CMD="$(command -v psql.exe)"
+copy_CMD="$(command -v cp)"
+pgctl_CMD="$(command -v pg_ctl.exe)"
+DB_NAME="postgres" 
+DB_USER="postgres" 
+DB_HOST="localhost" 
+DB_PORT="2345"
+DB_BASE_BACKUP='/mnt/d/postgres_replica/base.tar'
+DB_PRIMARY_WALDIR="D:\\postgres_archives"
+RECOVER_DIR="/mnt/d/postgres_replica/replica_a"
+PITR_TIME="2022-04-05 09:59:56"
+#USER_CHOICE_TIME_OR_LSN=""
+#PITR_LSN="" 
+
+if [ ! -z "${WSLENV}" ]; then  
+## We are on Windows, use copy for recovery command.
+  copy_CMD="copy" 
+fi
+
+if grep -i -Eq -- '-a' <<< "${1}"; then 
+  echo "We're going auto.. "
+else 
+read -p "Enter DB Name [default: ${DB_NAME}]: " USERVAL
+DB_NAME="${USERVAL:-${DB_NAME}}"
+USERVAL=''
+read -p "Enter DB User [default: ${DB_USER}]: " USERVAL
+DB_USER="${USERVAL:-${DB_USER}}"
+USERVAL=''
+read -p "Enter DB Host [default: ${DB_HOST}]: " USERVAL
+DB_HOST="${USERVAL:-${DB_HOST}}"
+USERVAL=''
+read -p "Enter DB Port [default: ${DB_PORT}]: " USERVAL
+DB_PORT="${USERVAL:-${DB_PORT}}"
+USERVAL=''
+read -p "Full path to DB Base Backup tar file: " USERVAL
+DB_BASE_BACKUP="${USERVAL:-${DB_BASE_BACKUP}}"
+USERVAL=''
+#if [ -z "${DB_BASE_BACKUP}" -o ! -e "${DB_BASE_BACKUP}" ]; then 
+if [ -z "${DB_BASE_BACKUP}" ]; then 
+  echo "** Error [${DB_BASE_BACKUP} empty ]: Need a valid db base backup in tar form (E.g. pg_basebackup -Ft ..)."
+  exit -1 
+fi 
+read -p "Enter Primary DB Wal Directory [for recover cmd]: " USERVAL
+DB_PRIMARY_WALDIR="${USERVAL:-${DB_PRIMARY_WALDIR}}"
+USERVAL=''
+#if [ -z "${DB_PRIMARY_WALDIR}" -o ! -e "${DB_PRIMARY_WALDIR}" ]; then 
+if [ -z "${DB_PRIMARY_WALDIR}" ]; then 
+  echo "** Error [${DB_PRIMARY_WALDIR} empty]: Need the pg_wal dir for primary db."
+  exit -1 
+fi 
+read -p "Enter timestamp for recovery: " USERVAL
+PITR_TIME="${USERVAL:-${PITR_TIME}}"
+USERVAL=''
+if [ -z "${PITR_TIME}" ]; then 
+  echo "** Error [${PITR_TIME} empty]: Need a valid timestamp (E.g. psql> select now();)."
+  exit -1 
+fi 
+USERVAL=''
+read -p "Enter empty directory for recovery [will be created if doesn't exist]: " USERVAL
+RECOVER_DIR="${USERVAL:-${RECOVER_DIR}}"
+if [ -z "${RECOVER_DIR}" ]; then 
+  echo "** Error [${RECOVER_DIR} empty]: Need a writeable fully qualified path."
+  exit -1 
+fi 
+fi ## End interactive block  
+
+#IFS='\n' read -r -d '' ADD2PITR_PGCONF <<'EOF'
+DB_PRIMARY_WALDIR="$(sed -E 's/([^\\])\\([^\\])/\1\\\\\2/g' <<< "${DB_PRIMARY_WALDIR}")"
+ADD2PITR_PGCONF=$(cat<<EOF
+archive_mode = off
+restore_command = 'copy "${DB_PRIMARY_WALDIR%\\}\\\\%f" "%p"' 
+recovery_target_time = '${PITR_TIME}'	# the time stamp up to which recovery will proceed
+recovery_target_timeline = '1'	# 'current', 'latest', or timeline ID
+recovery_target_action = 'promote'	# 'pause', 'promote', 'shutdown'
+hot_standby = off			# "off" disallows queries during recovery
+port = ${DB_PORT}			# (change requires restart)
+EOF
+)
+echo ""
+echo "##########################################################################################"
+echo "### CHECK carefully the PITR options before continuing:                                 ##"
+echo "##########################################################################################"
+echo "Adding the following entries to recovery db postgresql.conf:" 
+echo "${ADD2PITR_PGCONF}"
+echo ""
+echo "DB_NAME=${DB_NAME}" 
+echo "DB_USER=${DB_USER}" 
+echo "DB_HOST=${DB_HOST}" 
+echo "DB_PORT=${DB_PORT}" 
+echo "DB_BASE_BACKUP=${DB_BASE_BACKUP}" 
+echo "RECOVER_DIR=${RECOVER_DIR}" 
+echo "" 
+USERVAL=''
+read -p "Everything look ok? If you are ready to proceed enter 'y': " USERVAL
+
+! grep -i -q 'y' <<< "${USERVAL}" && echo "Aborting.." && exit 0
+
+echo "Exploding tar (${DB_BASE_BACKUP}) into recovery directory (${RECOVER_DIR}) ..."
+sleep 1
+mkdir -p "${RECOVER_DIR}"
+cd "${RECOVER_DIR}"
+tar xf "${DB_BASE_BACKUP}" 
+echo "Adding recovery options to postgresql.conf ..."
+sleep 1
+echo "${ADD2PITR_PGCONF}" >> postgresql.conf 
+echo "Touching recovery.signal ..."
+touch recovery.signal 
+sleep 1
+# "${createdb_CMD}" -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" "${DB_NAME}"
+
+WIN_RECOVER_DIR="$(sed 's#/mnt/##;s#/#:\\#;s#/#\\#g'<<<"${RECOVER_DIR}")" 
+echo "Starting PITR recovery (must be via Powershell, pg_ctl on wsl is broken at this time)..."
+echo "pg_ctl.exe -D \"${WIN_RECOVER_DIR}\" start" >> start_db.ps1 
+exec powershell.exe ./start_db.ps1 &
+sleep 20
+echo "Done, now connecting via psql so you can query the data. (e.g. then pg_dump your table)"
+"${psql_CMD}"  -h "${DB_HOST}" -p "${DB_PORT}" -U "${DB_USER}" -d "${DB_NAME}"
